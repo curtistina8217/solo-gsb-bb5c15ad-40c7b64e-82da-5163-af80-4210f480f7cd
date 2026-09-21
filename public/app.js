@@ -65,6 +65,16 @@ const els = {
   peopleCount: $('#people-count'),
   btnClearAll: $('#btn-clear-all'),
   btnClearLogs: $('#btn-clear-logs'),
+  btnRollcallStart: $('#btn-rollcall-start'),
+  rollcallBar: $('#rollcall-bar'),
+  rollcallTargetName: $('#rollcall-target-name'),
+  rollcallCountdown: $('#rollcall-countdown'),
+  rollcallProgress: $('#rollcall-progress'),
+  rollcallActionsMe: $('#rollcall-actions-me'),
+  rollcallActionsHost: $('#rollcall-actions-host'),
+  btnRollcallConfirm: $('#btn-rollcall-confirm'),
+  btnRollcallSkip: $('#btn-rollcall-skip'),
+  btnRollcallCancel: $('#btn-rollcall-cancel'),
   toast: $('#toast-container')
 };
 
@@ -487,6 +497,7 @@ function render() {
   const snap = state.snapshot;
   if (!snap) return;
   renderStage(snap);
+  renderRollcall(snap);
   renderQueue(snap);
   renderUndoBar(snap);
   renderSwapBar(snap);
@@ -517,6 +528,46 @@ function renderStage(snap) {
 
 // 最后 30 秒醒目提示的阈值
 const COUNTDOWN_WARN_MS = 30000;
+// 点名接力倒计时最后 5 秒醒目提示
+const ROLLCALL_WARN_MS = 5000;
+
+/**
+ * 队首点名接力状态条：当前对象、同步倒计时、本轮进度、本人确认/跳过操作。
+ * 倒计时基于服务端下发的 deadline 与 serverTs 校准后的时钟，断线重连后自然恢复。
+ */
+function renderRollcall(snap) {
+  const rc = snap.rollcall;
+  if (!rc) {
+    els.rollcallBar.hidden = true;
+    els.btnRollcallStart.disabled = false;
+    els.btnRollcallStart.classList.remove('is-disabled');
+    return;
+  }
+  els.rollcallBar.hidden = false;
+  els.btnRollcallStart.disabled = true;
+  els.btnRollcallStart.classList.add('is-disabled');
+
+  els.rollcallTargetName.textContent = nickOf(snap, rc.currentId);
+  const done = (rc.called || []).length;
+  els.rollcallProgress.textContent = `本轮已点名 ${done}/${rc.total} 人`;
+
+  const myId = state.me ? state.me.id : null;
+  const isMine = rc.currentId === myId;
+  els.rollcallActionsMe.hidden = !isMine;
+  // 主持人本人不会在队列中；主持人操作条由 CSS（.host-only）控制显隐
+  els.rollcallActionsHost.hidden = !(state.me && state.me.host);
+
+  updateRollcallCountdown();
+}
+
+function updateRollcallCountdown() {
+  const rc = state.snapshot && state.snapshot.rollcall;
+  if (!rc) return;
+  const remainMs = Math.max(rc.deadline - serverNow(), 0);
+  const remain = Math.ceil(remainMs / 1000);
+  els.rollcallCountdown.textContent = `${remain} 秒`;
+  els.rollcallCountdown.classList.toggle('timer-warning', remainMs <= ROLLCALL_WARN_MS);
+}
 
 function updateTimer() {
   const snap = state.snapshot;
@@ -537,7 +588,10 @@ function updateTimer() {
 }
 
 if (!state.timerHandle) {
-  state.timerHandle = setInterval(updateTimer, 250);
+  state.timerHandle = setInterval(() => {
+    updateTimer();
+    updateRollcallCountdown();
+  }, 250);
 }
 
 function renderQueue(snap) {
@@ -550,6 +604,9 @@ function renderQueue(snap) {
   const myId = state.me ? state.me.id : null;
   const isHost = !!(state.me && state.me.host);
   const myPending = myId ? (snap.swaps || []).find((s) => s.status === 'pending' && (s.from === myId || s.to === myId)) : null;
+  const rc = snap.rollcall;
+  const calledSet = rc ? new Set(rc.called) : null;
+  const pendingSet = rc ? new Set(rc.pending) : null;
 
   snap.order.forEach((pid, i) => {
     const p = pmap.get(pid);
@@ -559,6 +616,7 @@ function renderQueue(snap) {
     li.dataset.id = pid;
     if (state.me && pid === state.me.id) li.classList.add('is-me');
     if (drag && drag.item.dataset.id === pid) li.classList.add('dragging');
+    if (rc && rc.currentId === pid) li.classList.add('is-rollcall-current');
 
     const pendingHere = (snap.swaps || []).find(
       (s) => s.status === 'pending' && (s.from === pid || s.to === pid)
@@ -570,14 +628,26 @@ function renderQueue(snap) {
       swapTag = `<span class="swap-tag" title="${role}换位：与「${escapeHtml(nickOf(snap, otherId))}」">⇄ 换位${role}中</span>`;
     }
 
-    // 参与者：对队列中其他人可发起换位邀请；自己有待处理邀请或对方已有邀请时禁用
+    // 参与者：对队列中其他人可发起换位邀请；自己有待处理邀请或对方已有邀请时禁用；
+    // 点名接力进行中冻结换位入口。
     let swapInviteBtn = '';
-    if (!isHost && pid !== myId) {
+    if (!isHost && pid !== myId && !rc) {
       const busy = !!myPending || !!pendingHere;
       swapInviteBtn = `
         <button class="btn btn-ghost btn-mini swap-invite-btn ${busy ? 'is-disabled' : ''}"
                 data-act="swap-invite" ${busy ? 'disabled' : ''}
                 title="${busy ? '存在待处理的换位邀请' : `邀请「${escapeHtml(nick)}」交换位置`}">⇄ 换位</button>`;
+    }
+
+    let rollcallTag = '';
+    if (rc) {
+      if (rc.currentId === pid) {
+        rollcallTag = '<span class="rollcall-now-tag">📢 正在点名</span>';
+      } else if (calledSet.has(pid)) {
+        rollcallTag = '<span class="rollcall-done-tag">已跳过</span>';
+      } else if (pendingSet.has(pid)) {
+        rollcallTag = '<span class="rollcall-wait-tag">待点名</span>';
+      }
     }
 
     li.draggable = false; // 使用自定义 pointer 拖拽，同时兼容触屏
@@ -586,6 +656,7 @@ function renderQueue(snap) {
       <span class="queue-index">${i + 1}</span>
       <span class="queue-nick">${escapeHtml(nick)}</span>
       ${state.me && pid === state.me.id ? '<span class="me-tag">我</span>' : ''}
+      ${rollcallTag}
       ${swapTag}
       ${p && !p.online ? '<span class="offline-tag">离线</span>' : ''}
       ${swapInviteBtn}
@@ -759,6 +830,31 @@ els.btnClearAll.addEventListener('click', () => {
 els.btnClearLogs.addEventListener('click', () => {
   if (!confirm('确定清空操作记录？')) return;
   sendCmd({ type: 'clear_logs' });
+});
+
+// ---------------------------------------------------------------------------
+// 队首点名接力
+// ---------------------------------------------------------------------------
+
+els.btnRollcallStart.addEventListener('click', () => {
+  sendCmd({ type: 'rollcall_start' });
+});
+
+els.btnRollcallCancel.addEventListener('click', () => {
+  sendCmd({ type: 'rollcall_cancel' });
+});
+
+els.btnRollcallConfirm.addEventListener('click', () => {
+  const rc = state.snapshot && state.snapshot.rollcall;
+  if (!rc) return;
+  // callId 与 version 一起发送，服务端双重校验
+  sendCmd({ type: 'rollcall_confirm', callId: rc.callId });
+});
+
+els.btnRollcallSkip.addEventListener('click', () => {
+  const rc = state.snapshot && state.snapshot.rollcall;
+  if (!rc) return;
+  sendCmd({ type: 'rollcall_skip', callId: rc.callId });
 });
 
 // 安全撤销条：撤销最近一次主持人操作（版本冲突仍走 STALE_VERSION 流程）

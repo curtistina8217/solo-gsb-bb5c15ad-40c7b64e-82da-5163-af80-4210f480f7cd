@@ -83,7 +83,27 @@
               <option value="">不限时</option>
             </select>
           </label>
+          <button class="btn btn-primary btn-mini host-only rollcall-start-btn" id="btn-rollcall-start"
+                  type="button" title="按队列顺序逐一点名，每人 20 秒确认">📢 点名接力</button>
         </div>
+
+        <!-- 队首点名接力：倒计时、当前对象与本人操作 -->
+        <div class="rollcall-bar" id="rollcall-bar" hidden>
+          <div class="rollcall-info">
+            <span class="rollcall-tag">点名接力</span>
+            <span class="rollcall-target">正在点名：<b id="rollcall-target-name">—</b></span>
+            <span class="rollcall-countdown" id="rollcall-countdown">20</span>
+            <span class="rollcall-progress" id="rollcall-progress"></span>
+          </div>
+          <div class="rollcall-actions" id="rollcall-actions-me">
+            <button class="btn btn-primary btn-mini" id="btn-rollcall-confirm" type="button">✅ 我确认，开始发言</button>
+            <button class="btn btn-ghost btn-mini" id="btn-rollcall-skip" type="button">⏭ 跳过（移到队尾）</button>
+          </div>
+          <div class="rollcall-actions host-only" id="rollcall-actions-host">
+            <button class="btn btn-danger btn-mini" id="btn-rollcall-cancel" type="button">取消点名</button>
+          </div>
+        </div>
+
         <ul class="queue-list" id="queue-list"></ul>
         <div class="queue-empty" id="queue-empty">队列为空，等待申请发言</div>
 

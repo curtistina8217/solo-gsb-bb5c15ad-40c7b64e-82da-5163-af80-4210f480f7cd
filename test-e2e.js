@@ -10,6 +10,8 @@ const TEST_PORT = process.env.TEST_PORT || '3099';
 const BASE = `http://127.0.0.1:${TEST_PORT}`;
 // 测试用：把限时发言的 1「分钟」压缩为 50ms，便于快速验证到期自动结束
 const SPEAK_TIME_UNIT_MS = 50;
+// 测试用：点名确认时限压缩为 800ms，便于快速验证超时接力
+const ROLLCALL_TIMEOUT_MS = 800;
 let failures = 0;
 let serverProc = null;
 
@@ -925,6 +927,256 @@ async function main() {
     await h.close(); await g1.close();
   }
 
+  // ===========================================================================
+  // 队首点名接力（ROLLCALL_TIMEOUT_MS=800ms）
+  // ===========================================================================
+  {
+    const created = await createRoom('点名主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '点甲');
+    const g2 = await guestJoin(created.room, '点乙');
+    const g3 = await guestJoin(created.room, '点丙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    const id3 = g3.joined.you.id;
+
+    await waitStable(h, [g1, g2, g3]);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 3);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2, id3]);
+
+    // 23a. 启动：非主持人被拒；主持人启动后快照含 callId / deadline / 已点名成员
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'rollcall_start' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    h.lastError = null;
+    h.send({ type: 'rollcall_start', version: h.v - 1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.snapshot.rollcall, null, '过期命令不得启动点名');
+
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id1);
+    const rc1 = h.snapshot.rollcall;
+    assert.ok(/^cl_/.test(rc1.callId), '快照需包含 callId');
+    assert.strictEqual(rc1.total, 3);
+    assert.deepStrictEqual(rc1.called, [id1], '本轮已点名成员需随快照下发');
+    assert.deepStrictEqual(rc1.pending, [id2, id3]);
+    assert.ok(rc1.deadline > h.snapshot.serverTs, '快照需包含未来的截止时间');
+    assert.ok(rc1.deadline - h.snapshot.serverTs <= ROLLCALL_TIMEOUT_MS);
+    const callId1 = rc1.callId;
+
+    // 进行中再次启动 -> ROLLCALL_ACTIVE
+    h.lastError = null;
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'ROLLCALL_ACTIVE');
+
+    // 非当前对象不能确认/跳过；错误 callId 被拒（version 与 callId 双重校验）
+    g2.lastError = null;
+    await waitStable(h, [g2]);
+    g2.send({ type: 'rollcall_confirm', version: g2.v, callId: callId1 });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'ROLLCALL_NOT_YOURS');
+    g1.lastError = null;
+    g1.send({ type: 'rollcall_skip', version: g1.v, callId: 'cl_wrong_call' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_CALL');
+    // 旧版本确认 -> STALE_VERSION（即使 callId 正确）
+    g1.lastError = null;
+    g1.send({ type: 'rollcall_confirm', version: g1.v - 1, callId: callId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.snapshot.rollcall.callId, callId1, '被拒命令不改变点名状态');
+
+    // 23b. 当前对象主动跳过：移到队尾并自动点名下一人；本轮每人最多被点一次
+    await waitStable(h, [g1]);
+    g1.send({ type: 'rollcall_skip', version: g1.v, callId: callId1 });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id2);
+    assert.deepStrictEqual(h.snapshot.order, [id2, id3, id1], '跳过者移到队尾');
+    let rc = h.snapshot.rollcall;
+    assert.strictEqual(rc.callId, callId1, '同一轮 callId 不变');
+    assert.deepStrictEqual(rc.called, [id1, id2], '已点名集合按点名顺序增长');
+    assert.deepStrictEqual(rc.pending, [id3]);
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /主动跳过/.test(l.text)));
+
+    // 23c. 超时未确认：自动移到队尾并点名下一人（旧定时回调由 roundNo 守卫）
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id3,
+      ROLLCALL_TIMEOUT_MS + 1500, 'id2 超时后应自动点名 id3');
+    assert.deepStrictEqual(h.snapshot.order, [id3, id1, id2], 'id2 超时移到队尾');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /超时未确认/.test(l.text)));
+
+    // id3 也超时 -> 三人本轮都已点过 -> 接力结束
+    await h.waitFor((c) => c.snapshot.rollcall === null, ROLLCALL_TIMEOUT_MS + 1500);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2, id3], '全部跳过后队列保持轮后的队尾顺序');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /全部成员均已跳过/.test(l.text)));
+    // 旧定时回调不得在结束后再推进任何状态
+    const vStable = h.v;
+    await sleep(ROLLCALL_TIMEOUT_MS + 300);
+    assert.strictEqual(h.v, vStable, '点名结束后旧回调不得产生新版本');
+
+    // 23d. 确认：从队列移除并开始发言，接力在一人确认后结束
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id1);
+    const callId2 = h.snapshot.rollcall.callId;
+    assert.notStrictEqual(callId2, callId1, '新一轮应有新的 callId');
+    await waitStable(h, [g1]);
+    g1.send({ type: 'rollcall_confirm', version: g1.v, callId: callId2 });
+    await h.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === id1);
+    assert.strictEqual(h.snapshot.rollcall, null, '确认后本轮接力结束');
+    assert.deepStrictEqual(h.snapshot.order, [id2, id3], '确认者从队列移除');
+    assert.ok(h.snapshot.speaking.roundId, '确认后开始发言并产生轮次标识');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /已确认点名，开始发言/.test(l.text)));
+    await hostCmd(h, { type: 'end_speaking' });
+
+    // 23e. 旧定时回调不得推进新一轮：
+    // 先启动一轮、等其定时器排上，再取消并立即重启；旧轮回调到期时
+    // （第二轮才过了很短时间）不得推进第二轮，第二轮对象必须保持不变。
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id2);
+    await hostCmd(h, { type: 'rollcall_cancel' });
+    assert.strictEqual(h.snapshot.rollcall, null);
+    // 在旧轮定时器到期前 150ms 启动新一轮（旧轮剩余约 ROLLCALL_TIMEOUT_MS）
+    await sleep(150);
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id2);
+    const callIdB = h.snapshot.rollcall.callId;
+    const vAfterRestart = h.v;
+    // 等到被取消那一轮的定时器本应触发的时刻（约再等 650ms，小于第二轮 800ms）
+    await sleep(ROLLCALL_TIMEOUT_MS - 100);
+    assert.ok(h.snapshot.rollcall, '旧轮回调不得结束新一轮');
+    assert.strictEqual(h.snapshot.rollcall.callId, callIdB);
+    assert.strictEqual(h.snapshot.rollcall.currentId, id2, '旧轮回调不得提前推进新一轮的点名对象');
+    assert.strictEqual(h.v, vAfterRestart, '旧轮回调不得产生新版本');
+    // 第二轮自身的定时器到期后正常接力（id2 超时 -> id3）
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id3,
+      ROLLCALL_TIMEOUT_MS + 1500, '第二轮自身回调应正常推进');
+    await hostCmd(h, { type: 'rollcall_cancel' });
+
+    // 23f. 主持人取消点名：队列保持不变，后续可重新启动
+    const orderBeforeCancel = h.snapshot.order.slice();
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall);
+    await hostCmd(h, { type: 'rollcall_cancel' });
+    assert.strictEqual(h.snapshot.rollcall, null);
+    assert.deepStrictEqual(h.snapshot.order, orderBeforeCancel, '取消点名不改动队列');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /取消了队首点名/.test(l.text)));
+    h.lastError = null;
+    h.send({ type: 'rollcall_cancel', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_ROLLCALL');
+
+    // 23g. 断线重连后恢复当前对象与剩余时间（deadline/callId 不变）
+    await hostCmd(h, { type: 'clear' });
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    assert.deepStrictEqual(h.snapshot.order, [id2, id3]);
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id2);
+    const rcLive = h.snapshot.rollcall;
+    await g2.close();
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id2);
+      return p && p.online === false;
+    });
+    assert.ok(h.snapshot.rollcall && h.snapshot.rollcall.currentId === id2, '断线不改变点名对象');
+    const g2b = new Client();
+    await g2b.open();
+    g2b.send({ type: 'join', room: created.room, nick: '点乙', participantId: id2, secret: g2.joined.you.secret });
+    await g2b.waitFor((c) => c.joined && c.joined.you.id === id2);
+    assert.ok(g2b.snapshot.rollcall, '重连后恢复点名状态');
+    assert.strictEqual(g2b.snapshot.rollcall.callId, rcLive.callId, '重连后 callId 不变');
+    assert.strictEqual(g2b.snapshot.rollcall.currentId, id2, '重连后恢复当前点名对象');
+    assert.strictEqual(g2b.snapshot.rollcall.deadline, rcLive.deadline, '重连后截止时间不变');
+    const rcRemain = g2b.snapshot.rollcall.deadline - g2b.snapshot.serverTs;
+    assert.ok(rcRemain > 0 && rcRemain <= ROLLCALL_TIMEOUT_MS, `重连后恢复剩余时间（${rcRemain}ms）`);
+    // 重连后的本人确认可用
+    g2b.send({ type: 'rollcall_confirm', version: g2b.v, callId: rcLive.callId });
+    await h.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === id2);
+    assert.strictEqual(h.snapshot.rollcall, null);
+    assert.deepStrictEqual(h.snapshot.order, [id3], '重连确认后从队列移除');
+    await hostCmd(h, { type: 'end_speaking' });
+
+    // 23h. 当前对象取消发言：立即推进到下一人（不等待超时）；名单耗尽后接力结束
+    // 清空后重建队列 [id1, id2, id3]
+    await hostCmd(h, { type: 'clear' });
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2b, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 3);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2, id3]);
+
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id1);
+    const callIdH = h.snapshot.rollcall.callId;
+    // 让 id1、id2 依次超时跳过，id3 成为当前对象
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id2,
+      ROLLCALL_TIMEOUT_MS + 1500);
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id3,
+      ROLLCALL_TIMEOUT_MS + 1500);
+    assert.deepStrictEqual(h.snapshot.order, [id3, id1, id2]);
+    assert.deepStrictEqual(h.snapshot.rollcall.called, [id1, id2, id3]);
+    // 当前对象 id3 取消发言 -> 立即结束（不再等待超时）
+    await waitStable(h, [g3]);
+    g3.send({ type: 'cancel_speak', version: g3.v });
+    await h.waitFor((c) => c.snapshot.rollcall === null, 2000, '当前对象取消且名单耗尽 -> 接力结束');
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2], '取消者离开队列；跳过者位置不动');
+    assert.ok(callIdH.startsWith('cl_'));
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /无法继续接受点名/.test(l.text)),
+      '当前对象取消应记录自动推进');
+
+    // 23i. 空队列 / 有人发言时启动被拒
+    await hostCmd(h, { type: 'clear' });
+    assert.deepStrictEqual(h.snapshot.order, []);
+    h.lastError = null;
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'ROLLCALL_EMPTY');
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id3 });
+    h.lastError = null;
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'ROLLCALL_SPEAKING');
+    await hostCmd(h, { type: 'end_speaking' });
+
+    // 23j. 点名期间主持人直接请人发言 -> 本轮点名结束
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2b, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 3);
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id3 });
+    assert.strictEqual(h.snapshot.rollcall, null, '主持人直接请人发言应结束本轮点名');
+    assert.strictEqual(h.snapshot.speaking.id, id3);
+    assert.deepStrictEqual(h.snapshot.order, [id1, id2], '被请者从队列移除，未点到者不被移动');
+    await hostCmd(h, { type: 'end_speaking' });
+    await hostCmd(h, { type: 'clear' });
+
+    // 23k. 当前点名对象主动离开房间 -> 立即推进下一人；旧回调不得干扰
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2b, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    h.send({ type: 'rollcall_start', version: h.v });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id1);
+    g1.send({ type: 'leave' });
+    await h.waitFor((c) => c.snapshot.rollcall && c.snapshot.rollcall.currentId === id2,
+      2000, '当前对象离开后应立即点名下一人');
+    assert.deepStrictEqual(h.snapshot.order, [id2], '离开者从队列移除');
+    assert.deepStrictEqual(h.snapshot.rollcall.called, [id1, id2]);
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'rollcall' && /无法继续接受点名/.test(l.text)));
+    await hostCmd(h, { type: 'rollcall_cancel' });
+    await hostCmd(h, { type: 'clear' });
+
+    await h.close(); await g2b.close(); await g3.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
@@ -942,7 +1194,7 @@ async function main() {
 function startServer() {
   return new Promise((resolve, reject) => {
     serverProc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS) },
+      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS) },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let settled = false;
