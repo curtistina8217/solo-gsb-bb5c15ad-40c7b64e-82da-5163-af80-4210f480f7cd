@@ -15,6 +15,10 @@
  *   { type: "leave" }
  *   { type: "start_speaking", version, participantId, durationMin? }  // 主持人；durationMin 为 1~30 整数时开启限时发言
  *   { type: "end_speaking",   version }                 // 主持人
+ *   { type: "rollcall_start",  version }                // 主持人：启动队首点名接力
+ *   { type: "rollcall_confirm",version, callId }        // 被点名成员：确认，离队开始发言
+ *   { type: "rollcall_skip",   version, callId }        // 被点名成员：主动跳过，移到队尾
+ *   { type: "rollcall_cancel", version }                // 主持人：取消本轮点名
  *   { type: "reorder",        version, order:[pid...] } // 主持人
  *   { type: "remove",         version, participantId }  // 主持人
  *   { type: "undo_host",      version }                 // 主持人：安全撤销最近一次主持人操作
@@ -40,6 +44,16 @@
  * 自动结束本轮（version+1 并写操作记录，按普通状态变更使挂起撤销失效）。
  * 手动结束、撤销开始、切换发言人、移出/离开/清空都会使旧定时任务失效；
  * 回调内再校验 roundId，旧回调不会结束后续轮次。断线重连后倒计时继续。
+ *
+ * 队首点名接力：主持人 rollcall_start 后，服务端按队列顺序向队首发出
+ * ROLLCALL_TIMEOUT_MS（默认 20 秒）确认，快照 rollcall 字段下发
+ * callId（每次点名唯一）、deadline（截止时间）、called（本轮已点名成员）。
+ * 被点名成员 rollcall_confirm 即从队列移除并开始发言（点名结束）；
+ * 主动 rollcall_skip 或超时则移到队尾并自动点名下一人；同一轮每人最多
+ * 被点名一次，全部跳过（队首已在本轮点过名）后本轮结束。确认/跳过命令
+ * 同时校验 version 与 callId，回调内再校验 callId，旧定时回调不得推进
+ * 新一轮（或下一人）。主持人可 rollcall_cancel；点名进行中冻结队列变更；
+ * 被点名成员断线保留席位，重连后凭快照恢复当前对象与剩余倒计时。
  */
 
 'use strict';
@@ -61,6 +75,8 @@ const SWAP_RESOLVED_TTL_MS = parseInt(process.env.SWAP_RESOLVED_TTL_MS, 10) || 3
 const SPEAK_TIME_UNIT_MS = parseInt(process.env.SPEAK_TIME_UNIT_MS, 10) || 60000;
 const SPEAK_MIN_MINUTES = 1;
 const SPEAK_MAX_MINUTES = 30;
+// 队首点名接力：每位成员的确认时限（默认 20 秒）。测试可调小以快速验证超时接力
+const ROLLCALL_TIMEOUT_MS = parseInt(process.env.ROLLCALL_TIMEOUT_MS, 10) || 20000;
 
 const app = express();
 const server = http.createServer(app);
@@ -82,6 +98,13 @@ app.use(express.static(path.join(__dirname, 'public')));
  *   speaking: { id, startedAt, endsAt, roundId } | null,
  *                            // endsAt 为 null 表示不限时；roundId 是唯一轮次标识
  *   speakTimer,              // 当前轮次的到期定时器（Timeout | null）
+ *   rollcall: {              // 队首点名接力（进行中；null 表示未在点名）
+ *     callId,                // 当前这次点名的唯一标识（每次点名下一人都会变化）
+ *     participantId,         // 当前被点名成员
+ *     deadline,              // 本次点名确认截止时间
+ *     called: [pid]          // 本轮已点名成员（按点名顺序，每人至多一次）
+ *   } | null,
+ *   rollTimer,               // 当前这次点名的超时定时器（Timeout | null）
  *   swaps: Map<id, {
  *     id, from, to,          // 发起人 / 目标方 participantId
  *     version, fromPos, toPos,  // 发起时的队列版本与位置（下标）
@@ -110,6 +133,8 @@ function newRoom(code) {
     order: [],
     speaking: null,
     speakTimer: null,
+    rollcall: null,
+    rollTimer: null,
     swaps: new Map(),
     undo: null,
     logs: [],
@@ -179,6 +204,111 @@ function autoEndSpeaking(room, roundId) {
 }
 
 // ---------------------------------------------------------------------------
+// 队首点名接力：服务端定时任务（点名标识守卫）
+// ---------------------------------------------------------------------------
+
+/** 取消当前这次点名的超时定时器（确认/跳过/取消/清空时调用） */
+function clearRollTimer(room) {
+  if (room.rollTimer) {
+    clearTimeout(room.rollTimer);
+    room.rollTimer = null;
+  }
+}
+
+/** 立即结束点名：清理定时器与点名状态（不提交、不广播，由调用方负责提交） */
+function resetRollcall(room) {
+  clearRollTimer(room);
+  room.rollcall = null;
+}
+
+/**
+ * 点名当前队首：生成新的 callId、记录已点名成员、安排 20 秒超时。
+ * 调用前必须保证 room.order[0] 本轮尚未点过名。
+ */
+function callHead(room) {
+  const pid = room.order[0];
+  const callId = genId('rc_');
+  room.rollcall = {
+    callId,
+    participantId: pid,
+    deadline: Date.now() + ROLLCALL_TIMEOUT_MS,
+    called: room.rollcall ? room.rollcall.called.concat([pid]) : [pid]
+  };
+  scheduleRollTimer(room);
+  addLog(
+    room,
+    'rollcall',
+    `点名「${room.participants.get(pid)?.nick ?? '已离开'}」，请在 ${Math.round(ROLLCALL_TIMEOUT_MS / 1000)} 秒内确认`
+  );
+}
+
+/**
+ * 为当前这次点名安排超时接力。
+ * 回调内以 callId 二次校验：旧点名（已确认/跳过/取消）的回调不得推进下一人。
+ */
+function scheduleRollTimer(room) {
+  clearRollTimer(room);
+  const rc = room.rollcall;
+  if (!rc) return;
+  const callId = rc.callId;
+  const delay = Math.max(rc.deadline - Date.now(), 0);
+  room.rollTimer = setTimeout(() => {
+    room.rollTimer = null;
+    // 旧回调作废：点名已结束，或已推进到另一次点名
+    if (!room.rollcall || room.rollcall.callId !== callId) return;
+    rollcallSkip(room, callId, 'timeout');
+  }, delay);
+  if (room.rollTimer.unref) room.rollTimer.unref();
+}
+
+/**
+ * 跳过当前被点名成员（主动跳过 / 超时共用）：
+ * 队首移到队尾，随后自动点名下一人；若队首本轮已点过名（全部跳过），本轮结束。
+ */
+function rollcallSkip(room, callId, reason) {
+  const rc = room.rollcall;
+  if (!rc || rc.callId !== callId) return; // 防御性校验：旧调用不得推进
+  const pid = rc.participantId;
+  const nick = room.participants.get(pid)?.nick ?? '已离开';
+  clearRollTimer(room);
+
+  const idx = room.order.indexOf(pid);
+  if (idx !== -1) {
+    room.order.splice(idx, 1);
+    room.order.push(pid); // 跳过：移到队尾
+  }
+
+  // 自动点名下一人：队首本轮尚未点名才继续；否则本轮全部跳过，结束
+  const next = room.order[0];
+  if (next && !rc.called.includes(next)) {
+    room.rollcall = {
+      callId: genId('rc_'),
+      participantId: next,
+      deadline: Date.now() + ROLLCALL_TIMEOUT_MS,
+      called: rc.called.concat([next]) // 记录本轮新点名的成员（每人至多一次）
+    };
+    scheduleRollTimer(room);
+    addLog(
+      room,
+      'rollcall',
+      reason === 'timeout'
+        ? `「${nick}」未在 ${Math.round(ROLLCALL_TIMEOUT_MS / 1000)} 秒内确认，自动跳过；点名「${room.participants.get(next)?.nick ?? '已离开'}」`
+        : `「${nick}」主动跳过；点名「${room.participants.get(next)?.nick ?? '已离开'}」`
+    );
+  } else {
+    room.rollcall = null;
+    addLog(
+      room,
+      'rollcall',
+      reason === 'timeout'
+        ? `「${nick}」超时未确认，本轮所有成员均已跳过，点名结束`
+        : `「${nick}」主动跳过，本轮所有成员均已跳过，点名结束`
+    );
+  }
+  commit(room, { undoReason: 'rollcall_changed' });
+}
+
+// ---------------------------------------------------------------------------
 // 安全撤销
 // ---------------------------------------------------------------------------
 
@@ -188,6 +318,7 @@ const UNDO_REASON_TEXT = {
   speaking_changed: '当前发言状态出现新的变更',
   presence_changed: '房间成员发生变化',
   swap_changed: '换位状态出现新的变更',
+  rollcall_changed: '点名接力状态出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -253,6 +384,7 @@ const SWAP_REASON_TEXT = {
   left: '一方离开了房间',
   reordered: '主持人调整了发言顺序',
   cleared: '主持人清空了队列',
+  rollcall: '主持人开启了点名接力',
   position_changed: '双方位置已变化'
 };
 
@@ -337,6 +469,15 @@ function buildSnapshot(room) {
           startedAt: room.speaking.startedAt,
           endsAt: room.speaking.endsAt ?? null,
           roundId: room.speaking.roundId
+        }
+      : null,
+    rollcall: room.rollcall
+      ? {
+          callId: room.rollcall.callId,
+          participantId: room.rollcall.participantId,
+          nick: room.participants.get(room.rollcall.participantId)?.nick ?? '已离开',
+          deadline: room.rollcall.deadline,
+          called: room.rollcall.called.slice()
         }
       : null,
     participants: [...room.participants.values()].map((p) => ({
@@ -472,6 +613,10 @@ wss.on('connection', (ws) => {
         case 'swap_cancel':
         case 'start_speaking':
         case 'end_speaking':
+        case 'rollcall_start':
+        case 'rollcall_confirm':
+        case 'rollcall_skip':
+        case 'rollcall_cancel':
         case 'reorder':
         case 'remove':
         case 'undo_host':
@@ -645,6 +790,7 @@ function handleLeave(room, id, reason) {
   const nick = p.nick;
   const queuedIdx = room.order.indexOf(id);
   const wasSpeaking = room.speaking && room.speaking.id === id;
+  const wasRollTarget = room.rollcall && room.rollcall.participantId === id;
 
   if (wasSpeaking) {
     clearSpeakTimer(room);
@@ -657,6 +803,32 @@ function handleLeave(room, id, reason) {
   if (queuedIdx !== -1) room.order.splice(queuedIdx, 1);
   room.participants.delete(id);
   addLog(room, 'presence', `「${nick}」离开房间`);
+
+  // 点名进行中：若离开的是当前被点名成员，视为其放弃本次点名并接力下一人；
+  // 仅离开队列其他位置时，从本轮已点名名单中剔除，不改变当前倒计时。
+  if (room.rollcall) {
+    if (wasRollTarget) {
+      const called = room.rollcall.called;
+      clearRollTimer(room);
+      const next = room.order[0];
+      if (next && !called.includes(next)) {
+        room.rollcall = {
+          callId: genId('rc_'),
+          participantId: next,
+          deadline: Date.now() + ROLLCALL_TIMEOUT_MS,
+          called: called.concat([next])
+        };
+        scheduleRollTimer(room);
+        addLog(room, 'rollcall', `「${nick}」离开房间；点名「${room.participants.get(next)?.nick ?? '已离开'}」`);
+      } else {
+        room.rollcall = null;
+        addLog(room, 'rollcall', `「${nick}」离开房间，本轮点名结束`);
+      }
+    } else {
+      const ci = room.rollcall.called.indexOf(id);
+      if (ci !== -1) room.rollcall.called.splice(ci, 1);
+    }
+  }
   commit(room, { undoReason: 'presence_changed' });
 }
 
@@ -703,6 +875,29 @@ function requireHost(ws, room, isHost) {
   return true;
 }
 
+/** 点名接力进行中冻结队列变更（申请/取消/换位/重排/移出/开始发言/撤销） */
+function guardRollcallIdle(ws, room) {
+  if (room.rollcall) {
+    sendError(ws, '点名接力进行中，暂不能执行此操作', 'ROLLCALL_ACTIVE', room);
+    return false;
+  }
+  return true;
+}
+
+/** 确认/跳过命令的 callId 守卫：必须与当前这次点名一致 */
+function guardCallId(ws, msg, room) {
+  const callId = String(msg.callId || '');
+  if (!callId) {
+    sendError(ws, '命令缺少 callId', 'NO_CALL_ID', room);
+    return false;
+  }
+  if (!room.rollcall || room.rollcall.callId !== callId) {
+    sendError(ws, '本次点名已结束或已转交他人', 'STALE_CALL', room);
+    return false;
+  }
+  return true;
+}
+
 function handleCommand(ws, msg, room, pid, isHost) {
   if (!room) return sendError(ws, '尚未加入房间', 'NOT_JOINED');
   const me = room.participants.get(pid);
@@ -710,7 +905,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
 
   switch (msg.type) {
     case 'request_speak': {
-      if (!guardVersion(ws, msg, room)) return;
+      if (!guardVersion(ws, msg, room) || !guardRollcallIdle(ws, room)) return;
       if (room.speaking?.id === pid) {
         return sendError(ws, '你正在发言中', 'ALREADY_SPEAKING', room);
       }
@@ -723,7 +918,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
     }
 
     case 'cancel_speak': {
-      if (!guardVersion(ws, msg, room)) return;
+      if (!guardVersion(ws, msg, room) || !guardRollcallIdle(ws, room)) return;
       const idx = room.order.indexOf(pid);
       if (idx === -1) {
         return sendError(ws, '你不在发言队列中', 'NOT_QUEUED', room);
@@ -735,7 +930,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
     }
 
     case 'swap_invite': {
-      if (!guardVersion(ws, msg, room)) return;
+      if (!guardVersion(ws, msg, room) || !guardRollcallIdle(ws, room)) return;
       const fromPos = room.order.indexOf(pid);
       if (fromPos === -1) {
         return sendError(ws, '你不在发言队列中，无法换位', 'NOT_QUEUED', room);
@@ -854,7 +1049,8 @@ function handleCommand(ws, msg, room, pid, isHost) {
     }
 
     case 'start_speaking': {
-      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)
+        || !guardRollcallIdle(ws, room)) return;
       const targetId = String(msg.participantId || room.order[0] || '');
       const target = room.participants.get(targetId);
       if (!target) return sendError(ws, '参与者不存在', 'NO_PARTICIPANT', room);
@@ -947,8 +1143,67 @@ function handleCommand(ws, msg, room, pid, isHost) {
       return commit(room, { undoArm: true });
     }
 
-    case 'reorder': {
+    case 'rollcall_start': {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      if (room.rollcall) {
+        return sendError(ws, '点名接力已在进行中', 'ROLLCALL_ACTIVE', room);
+      }
+      if (room.speaking) {
+        return sendError(ws, '当前有人发言，无法开启点名', 'SPEAKER_ACTIVE', room);
+      }
+      if (room.order.length === 0) {
+        return sendError(ws, '队列为空，无人可点名', 'QUEUE_EMPTY', room);
+      }
+      // 点名期间冻结换位：先失效所有待处理邀请并记录
+      invalidateSwaps(room, 'rollcall');
+      callHead(room);
+      return commit(room, { undoReason: 'rollcall_changed' });
+    }
+
+    case 'rollcall_confirm': {
+      if (!guardVersion(ws, msg, room) || !guardCallId(ws, msg, room)) return;
+      if (room.speaking) {
+        return sendError(ws, '当前有人发言，无法确认', 'SPEAKER_ACTIVE', room);
+      }
+      const rc = room.rollcall;
+      if (rc.participantId !== pid) {
+        return sendError(ws, '当前点到的不是你，请等待你的回合', 'NOT_YOUR_TURN', room);
+      }
+      const target = room.participants.get(pid);
+      const nick = target ? target.nick : '已离开';
+      // 确认：从队列移除并开始发言（不限时；点名随之结束）
+      const idx = room.order.indexOf(pid);
+      if (idx !== -1) room.order.splice(idx, 1);
+      resetRollcall(room);
+      room.speaking = { id: pid, startedAt: Date.now(), endsAt: null, roundId: genId('rd_') };
+      addLog(room, 'rollcall', `「${nick}」已确认点名，开始发言`);
+      return commit(room, { undoReason: 'rollcall_changed' });
+    }
+
+    case 'rollcall_skip': {
+      if (!guardVersion(ws, msg, room) || !guardCallId(ws, msg, room)) return;
+      const rc = room.rollcall;
+      if (rc.participantId !== pid) {
+        return sendError(ws, '当前点到的不是你，请等待你的回合', 'NOT_YOUR_TURN', room);
+      }
+      // 主动跳过：移到队尾并自动点名下一人（或全部跳过后结束）
+      return rollcallSkip(room, rc.callId, 'skip');
+    }
+
+    case 'rollcall_cancel': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      if (!room.rollcall) {
+        return sendError(ws, '当前没有进行中的点名', 'NO_ROLLCALL', room);
+      }
+      const nick = room.participants.get(room.rollcall.participantId)?.nick ?? '已离开';
+      resetRollcall(room);
+      addLog(room, 'rollcall', `主持人取消了点名接力（停止于「${nick}」）`);
+      return commit(room, { undoReason: 'rollcall_changed' });
+    }
+
+    case 'reorder': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)
+        || !guardRollcallIdle(ws, room)) return;
       if (!Array.isArray(msg.order)) {
         return sendError(ws, 'order 必须是数组', 'BAD_ORDER', room);
       }
@@ -975,7 +1230,8 @@ function handleCommand(ws, msg, room, pid, isHost) {
     }
 
     case 'remove': {
-      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)
+        || !guardRollcallIdle(ws, room)) return;
       const targetId = String(msg.participantId || '');
       const target = room.participants.get(targetId);
       if (!target) return sendError(ws, '参与者不存在', 'NO_PARTICIPANT', room);
@@ -1005,7 +1261,8 @@ function handleCommand(ws, msg, room, pid, isHost) {
     }
 
     case 'undo_host':
-      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)
+        || !guardRollcallIdle(ws, room)) return;
       return handleUndoHost(ws, room);
 
     case 'clear': {
@@ -1013,6 +1270,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
       room.order = [];
       clearSpeakTimer(room);
       room.speaking = null;
+      resetRollcall(room); // 一键清空同时取消进行中的点名
       room.logs = [];
       invalidateSwaps(room, 'cleared');
       addLog(room, 'system', '主持人执行了一键清空（队列、当前发言、操作记录已重置）');
@@ -1174,6 +1432,7 @@ const heartbeat = setInterval(() => {
     );
     if (!anyOnline && now - room.lastSeen > ROOM_TTL_MS) {
       clearSpeakTimer(room);
+      clearRollTimer(room);
       rooms.delete(code);
     }
   }

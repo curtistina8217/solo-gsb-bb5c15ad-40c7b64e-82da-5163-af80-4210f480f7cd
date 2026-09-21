@@ -56,6 +56,8 @@ const els = {
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
   queueCount: $('#queue-count'),
+  btnRollcallStart: $('#btn-rollcall-start'),
+  rollcallBar: $('#rollcall-bar'),
   undoBar: $('#undo-bar'),
   swapBar: $('#swap-bar'),
   btnRequest: $('#btn-request'),
@@ -487,6 +489,7 @@ function render() {
   const snap = state.snapshot;
   if (!snap) return;
   renderStage(snap);
+  renderRollcall(snap);
   renderQueue(snap);
   renderUndoBar(snap);
   renderSwapBar(snap);
@@ -536,8 +539,72 @@ function updateTimer() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 队首点名接力
+// ---------------------------------------------------------------------------
+
+function renderRollcall(snap) {
+  const rc = snap.rollcall;
+  els.btnRollcallStart.disabled = !!rc || !!snap.speaking || snap.order.length === 0;
+  els.btnRollcallStart.textContent = rc ? '点名进行中…' : '📢 点名接力';
+
+  const bar = els.rollcallBar;
+  if (!rc) {
+    bar.hidden = true;
+    bar.textContent = '';
+    return;
+  }
+  bar.hidden = false;
+  bar.classList.remove('rollcall-mine');
+
+  const myId = state.me ? state.me.id : null;
+  const isMine = rc.participantId === myId;
+  bar.classList.toggle('rollcall-mine', isMine);
+  const calledSet = new Set(rc.called || []);
+
+  const actions = [];
+  if (isMine) {
+    actions.push(
+      `<button class="btn btn-primary btn-lg" data-roll-act="confirm" data-call-id="${escapeHtml(rc.callId)}">✅ 确认发言</button>`,
+      `<button class="btn btn-ghost btn-lg" data-roll-act="skip" data-call-id="${escapeHtml(rc.callId)}">跳过（移到队尾）</button>`
+    );
+  }
+  if (state.me && state.me.host) {
+    actions.push(`<button class="btn btn-danger" data-roll-act="cancel">取消点名</button>`);
+  }
+  const mineHint = isMine ? '<span class="rollcall-flag">轮到你了</span>' : '';
+
+  bar.innerHTML = `
+    <div class="rollcall-main">
+      <div class="rollcall-title">
+        <span class="rollcall-dot"></span>
+        队首点名接力 · 请 <span class="rollcall-nick">${escapeHtml(rc.nick)}</span> 确认
+        ${mineHint}
+      </div>
+      <div class="rollcall-countdown" data-role="rc-countdown" data-deadline="${rc.deadline}"></div>
+      <div class="rollcall-meta">本轮已点名 ${calledSet.size} 人：${
+        rc.called.map((id) => escapeHtml(nickOf(snap, id))).join('、') || '无'
+      }</div>
+    </div>
+    <div class="rollcall-actions">${actions.join('')}</div>
+  `;
+  updateRollcallCountdown();
+}
+
+function updateRollcallCountdown() {
+  const snap = state.snapshot;
+  const el = els.rollcallBar.querySelector('[data-role="rc-countdown"]');
+  if (!snap || !snap.rollcall || !el) return;
+  const remain = Math.max(snap.rollcall.deadline - serverNow(), 0);
+  el.textContent = `剩余 ${formatDuration(remain)} 确认`;
+  el.classList.toggle('timer-warning', remain <= 5000);
+}
+
 if (!state.timerHandle) {
-  state.timerHandle = setInterval(updateTimer, 250);
+  state.timerHandle = setInterval(() => {
+    updateTimer();
+    updateRollcallCountdown();
+  }, 250);
 }
 
 function renderQueue(snap) {
@@ -549,7 +616,9 @@ function renderQueue(snap) {
 
   const myId = state.me ? state.me.id : null;
   const isHost = !!(state.me && state.me.host);
-  const myPending = myId ? (snap.swaps || []).find((s) => s.status === 'pending' && (s.from === myId || s.to === myId)) : null;
+  const rc = snap.rollcall;
+  const rollActive = !!rc;
+  const myPending = myId && !rollActive ? (snap.swaps || []).find((s) => s.status === 'pending' && (s.from === myId || s.to === myId)) : null;
 
   snap.order.forEach((pid, i) => {
     const p = pmap.get(pid);
@@ -558,11 +627,13 @@ function renderQueue(snap) {
     li.className = 'queue-item';
     li.dataset.id = pid;
     if (state.me && pid === state.me.id) li.classList.add('is-me');
+    if (rc && rc.participantId === pid) li.classList.add('is-roll-target');
+    if (rc && rc.called.includes(pid)) li.classList.add('is-roll-called');
     if (drag && drag.item.dataset.id === pid) li.classList.add('dragging');
 
-    const pendingHere = (snap.swaps || []).find(
+    const pendingHere = !rollActive ? (snap.swaps || []).find(
       (s) => s.status === 'pending' && (s.from === pid || s.to === pid)
-    );
+    ) : null;
     let swapTag = '';
     if (pendingHere) {
       const otherId = pendingHere.from === pid ? pendingHere.to : pendingHere.from;
@@ -570,14 +641,21 @@ function renderQueue(snap) {
       swapTag = `<span class="swap-tag" title="${role}换位：与「${escapeHtml(nickOf(snap, otherId))}」">⇄ 换位${role}中</span>`;
     }
 
-    // 参与者：对队列中其他人可发起换位邀请；自己有待处理邀请或对方已有邀请时禁用
+    // 参与者：对队列中其他人可发起换位邀请；点名进行中冻结换位
     let swapInviteBtn = '';
-    if (!isHost && pid !== myId) {
+    if (!isHost && pid !== myId && !rollActive) {
       const busy = !!myPending || !!pendingHere;
       swapInviteBtn = `
         <button class="btn btn-ghost btn-mini swap-invite-btn ${busy ? 'is-disabled' : ''}"
                 data-act="swap-invite" ${busy ? 'disabled' : ''}
                 title="${busy ? '存在待处理的换位邀请' : `邀请「${escapeHtml(nick)}」交换位置`}">⇄ 换位</button>`;
+    }
+
+    let rollTag = '';
+    if (rc && rc.participantId === pid) {
+      rollTag = '<span class="roll-tag">📢 点名中</span>';
+    } else if (rc && rc.called.includes(pid)) {
+      rollTag = '<span class="roll-tag roll-tag-done">已跳过</span>';
     }
 
     li.draggable = false; // 使用自定义 pointer 拖拽，同时兼容触屏
@@ -586,10 +664,11 @@ function renderQueue(snap) {
       <span class="queue-index">${i + 1}</span>
       <span class="queue-nick">${escapeHtml(nick)}</span>
       ${state.me && pid === state.me.id ? '<span class="me-tag">我</span>' : ''}
+      ${rollTag}
       ${swapTag}
       ${p && !p.online ? '<span class="offline-tag">离线</span>' : ''}
       ${swapInviteBtn}
-      ${isHost ? `
+      ${isHost && !rollActive ? `
         <button class="btn btn-primary btn-mini" data-act="start" title="请其发言">▶ 开始</button>
         <button class="btn btn-ghost btn-mini" data-act="remove" title="移出队列">✕</button>
       ` : ''}
@@ -606,13 +685,13 @@ function renderQueue(snap) {
     }
   }
 
-  // 参与者的申请/取消按钮状态
+  // 参与者的申请/取消按钮状态（点名进行中冻结申请与取消）
   if (state.me && !state.me.host) {
     const myId = state.me.id;
     const inQueue = snap.order.includes(myId);
     const speaking = snap.speaking && snap.speaking.id === myId;
-    els.btnRequest.classList.toggle('hidden', inQueue || speaking);
-    els.btnCancel.classList.toggle('hidden', !inQueue);
+    els.btnRequest.classList.toggle('hidden', inQueue || speaking || rollActive);
+    els.btnCancel.classList.toggle('hidden', !inQueue || rollActive);
     els.btnRequest.disabled = speaking;
     els.btnRequest.textContent = speaking ? '你正在发言中' : '🙋 申请发言';
   }
@@ -751,6 +830,24 @@ els.btnEnd.addEventListener('click', () => {
   sendCmd({ type: 'end_speaking' });
 });
 
+els.btnRollcallStart.addEventListener('click', () => {
+  sendCmd({ type: 'rollcall_start' });
+});
+
+// 点名接力条：本人确认 / 跳过（携带当前 callId），主持人取消
+els.rollcallBar.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-roll-act]');
+  if (!btn || btn.disabled) return;
+  const act = btn.dataset.rollAct;
+  if (act === 'confirm') {
+    sendCmd({ type: 'rollcall_confirm', callId: btn.dataset.callId });
+  } else if (act === 'skip') {
+    sendCmd({ type: 'rollcall_skip', callId: btn.dataset.callId });
+  } else if (act === 'cancel') {
+    sendCmd({ type: 'rollcall_cancel' });
+  }
+});
+
 els.btnClearAll.addEventListener('click', () => {
   if (!confirm('确定一键清空？\n将清空发言队列、结束当前发言并清空操作记录。')) return;
   sendCmd({ type: 'clear' });
@@ -806,6 +903,7 @@ let drag = null;
 
 els.queueList.addEventListener('pointerdown', (e) => {
   if (!state.me || !state.me.host) return;
+  if (state.snapshot && state.snapshot.rollcall) return; // 点名进行中冻结排序
   const handle = e.target.closest('.drag-handle');
   if (!handle) return;
   const item = handle.closest('.queue-item');

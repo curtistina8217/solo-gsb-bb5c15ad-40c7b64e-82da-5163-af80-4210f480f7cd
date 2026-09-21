@@ -77,6 +77,8 @@
         <div class="panel-title">
           发言队列 <span class="count" id="queue-count">0</span>
           <span class="hint host-only" id="reorder-hint">（拖动调整顺序）</span>
+          <button class="btn btn-primary btn-mini host-only" id="btn-rollcall-start"
+                  type="button" title="按队列顺序依次点名，每人 20 秒确认">📢 点名接力</button>
           <label class="duration-picker host-only" title="开始发言时的限时时长（到期自动结束）">
             限时
             <select id="speak-duration">
@@ -86,6 +88,9 @@
         </div>
         <ul class="queue-list" id="queue-list"></ul>
         <div class="queue-empty" id="queue-empty">队列为空，等待申请发言</div>
+
+        <!-- 队首点名接力：当前对象、倒计时、本人确认/跳过、主持人取消 -->
+        <div class="rollcall-bar" id="rollcall-bar" hidden></div>
 
         <!-- 安全撤销：主持人最近一次可撤销操作的摘要 / 失效原因 -->
         <div class="undo-bar host-only" id="undo-bar" hidden></div>
